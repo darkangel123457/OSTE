@@ -4460,7 +4460,7 @@ def interactive_prompt():
     print(f"{'--'*33}\n")
     while True:
         try:
-            t = input(f"  {CY}> Tool name or URL: {R}").strip()
+            t = sys.argv[1].strip()
         except EOFError:
             fail("No input."); sys.exit(0)
         if t: return t
@@ -4473,7 +4473,7 @@ def interactive_download_url():
     print(f"  {DIM}Paste the DIRECT installer URL (.exe/.msi/.zip/.dmg/etc.){R}")
     print(f"  {DIM}Or press Enter to skip the file scan.{R}\n")
     try:
-        u = input(f"  {CY}> Installer URL (or blank to skip): {R}").strip()
+        u = sys.argv[2].strip()
     except (EOFError, KeyboardInterrupt):
         return ""
     return u
