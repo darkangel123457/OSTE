@@ -4481,7 +4481,7 @@ def interactive_download_url():
 
 def main():
     print(BANNER)
-    ensure_packages()
+    # ensure_packages()
 
     parser = argparse.ArgumentParser(prog="python OSFWTE8.py",
         description="OS/FT Analyzer v8 -- Open Source / Freeware Tool Security Analyzer")
