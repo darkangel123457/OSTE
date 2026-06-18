@@ -2217,7 +2217,7 @@ def _download_from_url(installer_url):
     session = req.Session()
     session.headers.update(_BROWSER_HDRS)
     session.verify  = VERIFY_SSL
-    session.proxies = PROXY
+    #session.proxies = PROXY
 
     MAGIC = {
         b'MZ':              '.exe',
