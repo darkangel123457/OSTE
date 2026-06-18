@@ -80,7 +80,6 @@ SNYK_TOKEN    = os.getenv("SNYK_TOKEN", "")
 #               (replaces brittle Snyk HTML scraping)
 
 # ── PROXY (per user request) ──────────────────────────────────────────────────
-VERIFY_SSL = False
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
