@@ -4488,7 +4488,6 @@ def main():
     grp = parser.add_mutually_exclusive_group()
     grp.add_argument("-n","--name",   metavar="NAME", help="Freeware name (e.g. 'VLC')")
     grp.add_argument("-u","--url",    metavar="URL",  help="GitHub/Bitbucket repo URL")
-    parser.add_argument("--tool_url")
     parser.add_argument("-d","--download", metavar="URL",
         help="Direct installer download URL (required for freeware file scan)")
     parser.add_argument("--skip-web",  action="store_true",
@@ -4505,19 +4504,20 @@ def main():
     non_interactive = args.no_interactive or bool(args.url or args.name)
 
     while True:
-        if  args.url:
+        if not args.name and not args.url:
+            target = interactive_prompt()
             if re.search(r"github\.com|bitbucket\.org|https?://", target, re.I):
                 args.url  = target; args.name = None
             else:
                 args.name = target; args.url  = None
 
         # For freeware flow, ask for download URL only in interactive mode
-        if args.name and not args.url and not args.skip_scan:
+        if args.name and not args.url and not args.download and not args.skip_scan:
             if non_interactive:
                 args.skip_scan = True
                 warn("No installer URL provided — file scan skipped")
             else:
-                args.download = agrs.tool_url
+                args.download = interactive_download_url() or None
                 if not args.download:
                     warn("No installer URL — file scan will be skipped")
                     args.skip_scan = True
