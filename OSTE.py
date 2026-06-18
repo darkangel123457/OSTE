@@ -80,9 +80,7 @@ SNYK_TOKEN    = os.getenv("SNYK_TOKEN", "")
 #               (replaces brittle Snyk HTML scraping)
 
 # ── PROXY (per user request) ──────────────────────────────────────────────────
-PROXY      = {"http": "http://127.0.0.1:8080", "https": "http://127.0.0.1:8080"}
-VERIFY_SSL = False
-
+VERIFY_SSL = false
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -339,6 +337,42 @@ def check_authenticity(info, timeout=15):
     if info["platform"] not in ("github","bitbucket"):
         return {}
     owner, repo = info["owner"], info["repo"]
+    hdrs = {"Accept":"application/vnd.github+json"}
+    if GH_TOKEN:
+        hdrs["Authorization"] = f"token {GH_TOKEN}"
+    base = f"https://api.github.com/repos/{owner}/{repo}"
+
+    def gh(url, params=None, default=None):
+        try:
+            r = req.get(url, headers=hdrs, params=params, timeout=timeout,
+                        verify=True)
+            if r.status_code == 200:
+                return r.json()
+            if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
+                warn("GitHub API rate limit reached — set GITHUB_TOKEN")
+            return default
+        except Exception:
+            return default
+
+    step("Fetching GitHub repo details")
+    d = gh(base, default={})
+    if not d:
+        return {"error": "Could not fetch repo data"}
+
+    stars        = d.get("stargazers_count", 0)
+    forks        = d.get("forks_count", 0)
+    watchers     = d.get("watchers_count", 0)
+    open_issues  = d.get("open_issues_count", 0)
+    license_name = (d.get("license") or {}).get("name", "None")
+    license_spdx = (d.get("license") or {}).get("spdx_id", "")
+    description  = d.get("description", "")
+    language     = d.get("language", "Unknown")
+    topics       = d.get("topics", [])
+    is_fork      = d.get("fork", False)
+    is_archived  = d.get("archived", False)
+    default_br   = d.get("default_branch", "main")
+    pushed_at    = d.get("pushed_at", "")
+    created_at   = d.get("created_at", "")
 
     def days_since(iso):
         if not iso: return None
@@ -348,328 +382,143 @@ def check_authenticity(info, timeout=15):
         except Exception:
             return None
 
-    # ── GITHUB PATH ─────────────────────────────────────────────────────────
-    if info["platform"] == "github":
-        hdrs = {"Accept":"application/vnd.github+json"}
-        if GH_TOKEN:
-            hdrs["Authorization"] = f"token {GH_TOKEN}"
-        base = f"https://api.github.com/repos/{owner}/{repo}"
+    days_inactive = days_since(pushed_at)
+    age_days      = days_since(created_at)
 
-        def gh(url, params=None, default=None):
-            try:
-                r = req.get(url, headers=hdrs, params=params, timeout=timeout,
-                            proxies=PROXY, verify=VERIFY_SSL)
-                if r.status_code == 200:
-                    return r.json()
-                if r.status_code == 403 and r.headers.get("X-RateLimit-Remaining") == "0":
-                    warn("GitHub API rate limit reached — set GITHUB_TOKEN")
-                return default
-            except Exception:
-                return default
+    lic_info = get_license_info(license_name, license_spdx)
+    ok(f"License: {license_name} → {lic_info['category']} (risk: {lic_info['risk']})")
 
-        step("Fetching GitHub repo details")
-        d = gh(base, default={})
-        if not d:
-            return {"error": "Could not fetch repo data"}
+    ok("Fetching contributors...")
+    contribs_data = gh(f"{base}/contributors", {"per_page": 100, "anon": "false"}, default=[])
+    contribs_data = contribs_data if isinstance(contribs_data, list) else []
+    contributors_count = len(contribs_data)
+    top_contributors = [{
+        "login":   c.get("login", "?"),
+        "commits": c.get("contributions", 0),
+        "profile": c.get("html_url", ""),
+    } for c in contribs_data[:5]]
 
-        stars        = d.get("stargazers_count", 0)
-        forks        = d.get("forks_count", 0)
-        watchers     = d.get("watchers_count", 0)
-        open_issues  = d.get("open_issues_count", 0)
-        license_name = (d.get("license") or {}).get("name", "None")
-        license_spdx = (d.get("license") or {}).get("spdx_id", "")
-        description  = d.get("description", "")
-        language     = d.get("language", "Unknown")
-        topics       = d.get("topics", [])
-        is_fork      = d.get("fork", False)
-        is_archived  = d.get("archived", False)
-        default_br   = d.get("default_branch", "main")
-        pushed_at    = d.get("pushed_at", "")
-        created_at   = d.get("created_at", "")
+    ok("Fetching commit history...")
+    commits_data = gh(f"{base}/commits", {"per_page": 30}, default=[])
+    commits_data = commits_data if isinstance(commits_data, list) else []
+    recent_commits = []
+    for c in commits_data[:10]:
+        cm = c.get("commit", {})
+        recent_commits.append({
+            "sha":     c.get("sha", "")[:8],
+            "message": cm.get("message", "")[:80],
+            "author":  cm.get("author", {}).get("name", "?"),
+            "date":    cm.get("author", {}).get("date", "")[:10],
+        })
 
-        days_inactive = days_since(pushed_at)
-        age_days      = days_since(created_at)
+    ok("Fetching releases...")
+    releases_data = gh(f"{base}/releases", {"per_page": 5}, default=[])
+    releases_data = releases_data if isinstance(releases_data, list) else []
+    latest_release = {}
+    if releases_data:
+        lr = releases_data[0]
+        latest_release = {
+            "tag":          lr.get("tag_name", ""),
+            "name":         lr.get("name", ""),
+            "published_at": lr.get("published_at", "")[:10],
+            "prerelease":   lr.get("prerelease", False),
+        }
 
-        lic_info = get_license_info(license_name, license_spdx)
-        ok(f"License: {license_name} → {lic_info['category']} (risk: {lic_info['risk']})")
-
-        ok("Fetching contributors...")
-        contribs_data = gh(f"{base}/contributors", {"per_page": 100, "anon": "false"}, default=[])
-        contribs_data = contribs_data if isinstance(contribs_data, list) else []
-        contributors_count = len(contribs_data)
-        top_contributors = [{
-            "login":   c.get("login", "?"),
-            "commits": c.get("contributions", 0),
-            "profile": c.get("html_url", ""),
-        } for c in contribs_data[:5]]
-
-        ok("Fetching commit history...")
-        commits_data = gh(f"{base}/commits", {"per_page": 30}, default=[])
-        commits_data = commits_data if isinstance(commits_data, list) else []
-        recent_commits = []
-        for c in commits_data[:10]:
-            cm = c.get("commit", {})
-            recent_commits.append({
-                "sha":     c.get("sha", "")[:8],
-                "message": cm.get("message", "")[:80],
-                "author":  cm.get("author", {}).get("name", "?"),
-                "date":    cm.get("author", {}).get("date", "")[:10],
-            })
-
-        ok("Fetching releases...")
-        releases_data = gh(f"{base}/releases", {"per_page": 5}, default=[])
-        releases_data = releases_data if isinstance(releases_data, list) else []
-        latest_release = {}
-        if releases_data:
-            lr = releases_data[0]
-            latest_release = {
-                "tag":          lr.get("tag_name", ""),
-                "name":         lr.get("name", ""),
-                "published_at": lr.get("published_at", "")[:10],
-                "prerelease":   lr.get("prerelease", False),
-            }
-
-        ok("Checking security files (via repo tree — no extra API calls)...")
-        try:
-            _tree_r = gh(f"{base}/git/trees/{default_br}", {"recursive": "0"}, default={})
-            _tree_paths = {n.get("path","").lower() for n in (_tree_r.get("tree") or [])}
-            _gh_tree_r  = gh(f"https://api.github.com/repos/{owner}/{repo}/contents/.github",
-                             default=[])
-            _gh_paths   = {(f".github/{n.get('name','')}").lower()
-                           for n in (_gh_tree_r if isinstance(_gh_tree_r, list) else [])}
-            _all_paths  = _tree_paths | _gh_paths
-        except Exception:
-            _all_paths  = set()
-        has_security_md  = "security.md" in _all_paths
-        has_readme       = "readme.md" in _all_paths or "readme" in _all_paths or "readme.rst" in _all_paths
-        has_license_file = "license" in _all_paths or "license.md" in _all_paths or "license.txt" in _all_paths
-        has_codeowners   = "codeowners" in _all_paths or ".github/codeowners" in _all_paths
-
-        ok("Fetching open security issues...")
-        issues_data = gh(f"{base}/issues",
-                         {"state": "open", "per_page": 50, "labels": "security"},
+    ok("Checking security files (via repo tree — no extra API calls)...")
+    # Fetch the top-level tree once and check membership instead of 4-6 individual
+    # /contents/ requests. The tree also powers the dep-file walk later.
+    try:
+        _tree_r = gh(f"{base}/git/trees/{default_br}", {"recursive": "0"}, default={})
+        _tree_paths = {n.get("path","").lower() for n in (_tree_r.get("tree") or [])}
+        _gh_tree_r  = gh(f"https://api.github.com/repos/{owner}/{repo}/contents/.github",
                          default=[])
-        issues_data = issues_data if isinstance(issues_data, list) else []
-        security_issues = [{
-            "title":  i.get("title", "")[:80],
-            "url":    i.get("html_url", ""),
-            "opened": i.get("created_at", "")[:10],
-        } for i in issues_data[:5]]
+        _gh_paths   = {(f".github/{n.get('name','')}").lower()
+                       for n in (_gh_tree_r if isinstance(_gh_tree_r, list) else [])}
+        _all_paths  = _tree_paths | _gh_paths
+    except Exception:
+        _all_paths  = set()
+    has_security_md  = "security.md" in _all_paths
+    has_readme       = "readme.md" in _all_paths or "readme" in _all_paths or "readme.rst" in _all_paths
+    has_license_file = "license" in _all_paths or "license.md" in _all_paths or "license.txt" in _all_paths
+    has_codeowners   = "codeowners" in _all_paths or ".github/codeowners" in _all_paths
 
-        ok("Checking CI/CD workflows...")
-        workflows = gh(f"{base}/actions/workflows", default={})
-        workflow_names = [w.get("name", "?")
-                          for w in (workflows.get("workflows", []) if isinstance(workflows, dict) else [])][:5]
+    ok("Fetching open security issues...")
+    issues_data = gh(f"{base}/issues",
+                     {"state": "open", "per_page": 50, "labels": "security"},
+                     default=[])
+    issues_data = issues_data if isinstance(issues_data, list) else []
+    security_issues = [{
+        "title":  i.get("title", "")[:80],
+        "url":    i.get("html_url", ""),
+        "opened": i.get("created_at", "")[:10],
+    } for i in issues_data[:5]]
 
-        flags = []
-        if license_name == "None":
-            flags.append("No license -- redistribution rights unclear (legally risky)")
-        if lic_info["risk"] == "HIGH":
-            flags.append(f"License risk HIGH: {lic_info['note']}")
-        if days_inactive and days_inactive > 365:
-            flags.append(f"Inactive {days_inactive} days -- possibly abandoned")
-        if stars < 10 and forks < 3:
-            flags.append("Very low community trust signals")
-        if age_days and age_days < 30:
-            flags.append("Repository created less than 30 days ago")
-        if not has_readme:
-            flags.append("No README -- limited transparency")
-        if is_fork:
-            flags.append("This is a fork -- check original repo")
-        if is_archived:
-            flags.append("Repository is archived -- no longer maintained")
-        if contributors_count <= 1:
-            flags.append("Single contributor -- bus factor risk")
-        if not has_security_md:
-            flags.append("No SECURITY.md -- no vulnerability disclosure policy")
-        if not workflow_names:
-            flags.append("No CI/CD workflows found")
+    ok("Checking CI/CD workflows...")
+    workflows = gh(f"{base}/actions/workflows", default={})
+    workflow_names = [w.get("name", "?")
+                      for w in (workflows.get("workflows", []) if isinstance(workflows, dict) else [])][:5]
 
-        result = {
-            "platform":           "github",
-            "url":                f"https://github.com/{owner}/{repo}",
-            "description":        description,
-            "language":           language,
-            "topics":             topics,
-            "stars":              stars,
-            "forks":              forks,
-            "watchers":           watchers,
-            "open_issues":        open_issues,
-            "license":            license_name,
-            "license_spdx":       license_spdx,
-            "license_info":       lic_info,
-            "is_fork":            is_fork,
-            "is_archived":        is_archived,
-            "default_branch":     default_br,
-            "created_at":         created_at[:10],
-            "last_pushed":        pushed_at[:10],
-            "days_inactive":      days_inactive,
-            "repo_age_days":      age_days,
-            "contributors_count": contributors_count,
-            "top_contributors":   top_contributors,
-            "recent_commits":     recent_commits,
-            "latest_release":     latest_release,
-            "has_readme":         has_readme,
-            "has_license_file":   has_license_file,
-            "has_security_md":    has_security_md,
-            "has_codeowners":     has_codeowners,
-            "ci_workflows":       workflow_names,
-            "security_issues":    security_issues,
-            "risk_flags":         flags,
-        }
+    flags = []
+    if license_name == "None":
+        flags.append("No license -- redistribution rights unclear (legally risky)")
+    if lic_info["risk"] == "HIGH":
+        flags.append(f"License risk HIGH: {lic_info['note']}")
+    if days_inactive and days_inactive > 365:
+        flags.append(f"Inactive {days_inactive} days -- possibly abandoned")
+    if stars < 10 and forks < 3:
+        flags.append("Very low community trust signals")
+    if age_days and age_days < 30:
+        flags.append("Repository created less than 30 days ago")
+    if not has_readme:
+        flags.append("No README -- limited transparency")
+    if is_fork:
+        flags.append("This is a fork -- check original repo")
+    if is_archived:
+        flags.append("Repository is archived -- no longer maintained")
+    if contributors_count <= 1:
+        flags.append("Single contributor -- bus factor risk")
+    if not has_security_md:
+        flags.append("No SECURITY.md -- no vulnerability disclosure policy")
+    if not workflow_names:
+        flags.append("No CI/CD workflows found")
 
-        ok(f"Stars={stars} Forks={forks} Contributors={contributors_count} Inactive={days_inactive}d")
-        for f in flags:
-            warn(f)
-        return result
+    result = {
+        "platform":           "github",
+        "url":                f"https://github.com/{owner}/{repo}",
+        "description":        description,
+        "language":           language,
+        "topics":             topics,
+        "stars":              stars,
+        "forks":              forks,
+        "watchers":           watchers,
+        "open_issues":        open_issues,
+        "license":            license_name,
+        "license_spdx":       license_spdx,
+        "license_info":       lic_info,
+        "is_fork":            is_fork,
+        "is_archived":        is_archived,
+        "default_branch":     default_br,
+        "created_at":         created_at[:10],
+        "last_pushed":        pushed_at[:10],
+        "days_inactive":      days_inactive,
+        "repo_age_days":      age_days,
+        "contributors_count": contributors_count,
+        "top_contributors":   top_contributors,
+        "recent_commits":     recent_commits,
+        "latest_release":     latest_release,
+        "has_readme":         has_readme,
+        "has_license_file":   has_license_file,
+        "has_security_md":    has_security_md,
+        "has_codeowners":     has_codeowners,
+        "ci_workflows":       workflow_names,
+        "security_issues":    security_issues,
+        "risk_flags":         flags,
+    }
 
-    # ── BITBUCKET PATH ──────────────────────────────────────────────────────
-    elif info["platform"] == "bitbucket":
-        step("Fetching Bitbucket repo details")
-        base = f"https://api.bitbucket.org/2.0/repositories/{owner}/{repo}"
-
-        def bb(url, params=None, default=None):
-            try:
-                r = req.get(url, params=params, timeout=timeout,
-                            proxies=PROXY, verify=VERIFY_SSL)
-                if r.status_code == 200:
-                    return r.json()
-                return default
-            except Exception:
-                return default
-
-        d = bb(base, default={})
-        if not d:
-            return {"error": "Could not fetch Bitbucket repo data"}
-
-        description  = d.get("description", "")
-        language     = d.get("language", "Unknown")
-        created_at   = d.get("created_on", "")
-        pushed_at    = d.get("updated_on", "")
-        default_br   = (d.get("mainbranch") or {}).get("name", "main")
-        is_fork      = "parent" in d
-        is_archived  = False
-
-        stars = 0
-        forks = 0
-        watchers = 0
-        open_issues = 0
-        license_name = "None"
-        license_spdx = ""
-
-        days_inactive = days_since(pushed_at)
-        age_days      = days_since(created_at)
-
-        ok("Fetching Bitbucket commit history...")
-        commits_r = bb(f"{base}/commits", {"pagelen": 30}, default={})
-        commits_values = commits_r.get("values", []) if isinstance(commits_r, dict) else []
-
-        recent_commits = []
-        for c in commits_values[:10]:
-            author = c.get("author", {})
-            author_name = author.get("user", {}).get("display_name") or author.get("raw", "?")
-            if " <" in author_name:
-                author_name = author_name.split(" <")[0]
-            recent_commits.append({
-                "sha":     c.get("hash", "")[:8],
-                "message": c.get("message", "")[:80].strip(),
-                "author":  author_name,
-                "date":    c.get("date", "")[:10],
-            })
-
-        contrib_counts = {}
-        for c in commits_values:
-            author = c.get("author", {})
-            name_val = author.get("user", {}).get("display_name") or author.get("raw", "?")
-            if " <" in name_val:
-                name_val = name_val.split(" <")[0]
-            if name_val and name_val != "?":
-                contrib_counts[name_val] = contrib_counts.get(name_val, 0) + 1
-
-        sorted_contribs = sorted(contrib_counts.items(), key=lambda x: x[1], reverse=True)
-        contributors_count = len(contrib_counts)
-        top_contributors = [{
-            "login":   name_val,
-            "commits": count_val,
-            "profile": f"https://bitbucket.org/{owner}",
-        } for name_val, count_val in sorted_contribs[:5]]
-
-        ok("Fetching Bitbucket tags...")
-        tags_r = bb(f"{base}/refs/tags", {"pagelen": 5}, default={})
-        tags_values = tags_r.get("values", []) if isinstance(tags_r, dict) else []
-        latest_release = {}
-        if tags_values:
-            lt = tags_values[0]
-            latest_release = {
-                "tag":          lt.get("name", ""),
-                "name":         lt.get("name", ""),
-                "published_at": (lt.get("target") or {}).get("date", "")[:10],
-                "prerelease":   False,
-            }
-
-        ok("Checking Bitbucket repository files...")
-        src_r = bb(f"{base}/src/{default_br}/", {"pagelen": 100}, default={})
-        src_values = src_r.get("values", []) if isinstance(src_r, dict) else []
-        _all_paths = {item.get("path", "").lower() for item in src_values}
-
-        has_readme = any(p in _all_paths for p in ("readme.md", "readme", "readme.rst", "readme.txt"))
-        has_license_file = any(p in _all_paths for p in ("license", "license.txt", "license.md", "copying"))
-        has_security_md = "security.md" in _all_paths
-        has_codeowners = False
-        workflow_names = []
-        if "bitbucket-pipelines.yml" in _all_paths:
-            workflow_names = ["Bitbucket Pipelines"]
-
-        security_issues = []
-        flags = []
-        if days_inactive and days_inactive > 365:
-            flags.append(f"Inactive {days_inactive} days -- possibly abandoned")
-        if age_days and age_days < 30:
-            flags.append("Repository created less than 30 days ago")
-        if not has_readme:
-            flags.append("No README -- limited transparency")
-        if is_fork:
-            flags.append("This is a fork -- check original repo")
-
-        lic_info = get_license_info(license_name, license_spdx)
-
-        result = {
-            "platform":           "bitbucket",
-            "url":                f"https://bitbucket.org/{owner}/{repo}",
-            "description":        description,
-            "language":           language,
-            "topics":             [],
-            "stars":              stars,
-            "forks":              forks,
-            "watchers":           watchers,
-            "open_issues":        open_issues,
-            "license":            license_name,
-            "license_spdx":       license_spdx,
-            "license_info":       lic_info,
-            "is_fork":            is_fork,
-            "is_archived":        False,
-            "default_branch":     default_br,
-            "created_at":         created_at[:10] if created_at else "",
-            "last_pushed":        pushed_at[:10] if pushed_at else "",
-            "days_inactive":      days_inactive,
-            "repo_age_days":      age_days,
-            "contributors_count": contributors_count,
-            "top_contributors":   top_contributors,
-            "recent_commits":     recent_commits,
-            "latest_release":     latest_release,
-            "has_readme":         has_readme,
-            "has_license_file":   has_license_file,
-            "has_security_md":    has_security_md,
-            "has_codeowners":     has_codeowners,
-            "ci_workflows":       workflow_names,
-            "security_issues":    security_issues,
-            "risk_flags":         flags,
-        }
-
-        ok(f"Contributors={contributors_count} Inactive={days_inactive}d")
-        for f in flags:
-            warn(f)
-        return result
+    ok(f"Stars={stars} Forks={forks} Contributors={contributors_count} Inactive={days_inactive}d")
+    for f in flags:
+        warn(f)
+    return result
 
 
 # =============================================================================
@@ -746,7 +595,7 @@ def collect_vulns(info, timeout=25):
             else:
                 _time.sleep(nvd_pause)
             r = req.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
-                        params=params, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                        params=params, timeout=timeout, verify=True)
             if r.status_code == 200:
                 sources_used.append("NVD")
                 data  = r.json()
@@ -768,7 +617,7 @@ def collect_vulns(info, timeout=25):
                     page_params["startIndex"] = fetched
                     r2 = req.get("https://services.nvd.nist.gov/rest/json/cves/2.0",
                                  params=page_params, timeout=timeout,
-                                 proxies=PROXY, verify=VERIFY_SSL)
+                                 verify=True)
                     if r2.status_code != 200: break
                     more = r2.json().get("vulnerabilities", [])
                     if not more: break
@@ -810,14 +659,13 @@ def collect_vulns(info, timeout=25):
             batch_queries.append({"package": {
                 "name": f"{info['owner']}:{kw}", "ecosystem": "Maven"}})
     if info.get("url"):
-        plat = info.get("platform", "github")
         batch_queries.append({"package": {"name": kw,
-            "purl": f"pkg:{plat}/{info.get('owner','')}/{kw}"}})
+            "purl": f"pkg:github/{info.get('owner','')}/{kw}"}})
 
     try:
         r = req.post("https://api.osv.dev/v1/querybatch",
                      json={"queries": batch_queries},
-                     timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                     timeout=timeout, verify=True)
         if r.status_code == 200:
             sources_used.append("OSV")
             results = r.json().get("results", [])
@@ -840,7 +688,7 @@ def collect_vulns(info, timeout=25):
                 try:
                     quoted_id = quote(vid)
                     vr = req.get(f"https://api.osv.dev/v1/vulns/{quoted_id}",
-                                 timeout=15, proxies=PROXY, verify=VERIFY_SSL)
+                                 timeout=15, verify=True)
                     if vr.status_code == 200:
                         return vid, vr.json()
                     elif vr.status_code == 429:
@@ -909,12 +757,10 @@ def collect_vulns(info, timeout=25):
         elif repo_lang_g in ("javascript","typescript"):
             affects_candidates.append(kw)
         elif repo_lang_g == "go":
-            # Go uses full module path — try both the canonical platform/owner/repo
+            # Go uses full module path — try both the canonical github.com/owner/repo
             # form and the bare repo name (for packages published under other domains)
             if info.get("owner"):
-                plat = info.get("platform", "github")
-                domain = "bitbucket.org" if plat == "bitbucket" else "github.com"
-                affects_candidates.append(f"{domain}/{info['owner']}/{kw}")
+                affects_candidates.append(f"github.com/{info['owner']}/{kw}")
                 # Also try golang.org/x/<name> for stdlib-adjacent packages
                 affects_candidates.append(f"golang.org/x/{kw}")
         elif repo_lang_g == "ruby":
@@ -934,7 +780,7 @@ def collect_vulns(info, timeout=25):
                 r = req.get("https://api.github.com/advisories",
                             params={"affects": coord, "per_page": 30},
                             headers=gh_hdrs, timeout=timeout,
-                            proxies=PROXY, verify=VERIFY_SSL)
+                            verify=True)
                 if r.status_code == 200:
                     advs = r.json() if isinstance(r.json(), list) else []
                     if advs:
@@ -964,7 +810,7 @@ def collect_vulns(info, timeout=25):
                 r = req.get("https://api.github.com/advisories",
                             params={"q": kw, "per_page": 30, "type": "reviewed"},
                             headers=gh_hdrs, timeout=timeout,
-                            proxies=PROXY, verify=VERIFY_SSL)
+                            verify=True)
                 if r.status_code == 200:
                     advs = r.json() if isinstance(r.json(), list) else []
                     matched = []
@@ -1473,7 +1319,7 @@ def _check_snyk(name, ecosystem, version=None, timeout=12):
                 "Accept": "application/json",
                 "User-Agent": "OSFWTE8-SecurityAnalyzer/8"
             }
-            r = req.get(api_url, headers=headers, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+            r = req.get(api_url, headers=headers, timeout=timeout, verify=True)
             if r.status_code == 200:
                 data = r.json()
                 vulns = data.get("issues", {}).get("vulnerabilities", [])
@@ -1519,7 +1365,7 @@ def _check_snyk(name, ecosystem, version=None, timeout=12):
             headers={"Content-Type": "application/json",
                      "Accept": "application/json",
                      "User-Agent": "OSFWTE8-SecurityAnalyzer/8"},
-            timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+            timeout=timeout, verify=True)
 
         if r.status_code == 200:
             data  = r.json()
@@ -1580,7 +1426,7 @@ def _check_web_mentions(name, ecosystem, timeout=12):
                                    "AppleWebKit/537.36 (KHTML, like Gecko) "
                                    "Chrome/124.0.0.0 Safari/537.36",
                      "Accept": "text/html,application/xhtml+xml"},
-            timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+            timeout=timeout, verify=True)
         if r.status_code == 200:
             html = r.text
             # Extract result titles, snippets, and URLs from DDG HTML results
@@ -1610,13 +1456,13 @@ def scan_dependencies(info, timeout=15):
     """
     import requests as req
 
-    if info["type"] != "url" or info["platform"] not in ("github", "bitbucket"):
+    if info["type"] != "url" or info["platform"] != "github":
         # C6: show explicit warning instead of silently returning empty results
         plat = info.get("platform","unknown")
-        if info["type"] != "url":
-            warn("Dependency scan: only available for repositories (URL input). Skipping.")
-        else:
-            warn(f"Dependency scan: Platform '{plat}' not supported. Skipping.")
+        if plat == "bitbucket":
+            warn("Dependency scan: Bitbucket repos not supported — GitHub only. Skipping.")
+        elif info["type"] != "url":
+            warn("Dependency scan: only available for GitHub repos (URL input). Skipping.")
         return {"dep_files_found":[],"total_packages":0,"all_packages":[],
                 "vulnerable_packages":[],"vuln_count":0,
                 "skipped_reason": f"Platform '{plat}' not supported for dependency scan"}
@@ -1624,7 +1470,7 @@ def scan_dependencies(info, timeout=15):
     hdrs = {"Accept":"application/vnd.github+json","X-GitHub-Api-Version":"2022-11-28"}
     if GH_TOKEN:
         hdrs["Authorization"] = f"Bearer {GH_TOKEN}"
-    elif info["platform"] == "github":
+    else:
         warn("No GITHUB_TOKEN set — GitHub API limited to 60 req/hr")
 
     owner, repo = info["owner"], info["repo"]
@@ -1658,24 +1504,11 @@ def scan_dependencies(info, timeout=15):
 
         r = None
         for br in branches_to_try:
-            if info["platform"] == "github":
-                # 1. Try GitHub REST API (requires token for private, consumes API limits for public)
-                if GH_TOKEN:
-                    zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{br}"
-                    try:
-                        r_temp = req.get(zip_url, headers=hdrs, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
-                        if r_temp.status_code == 200:
-                            r = r_temp
-                            default_br = br
-                            break
-                    except Exception:
-                        pass
-
-                # 2. Try GitHub Public Head Archive URL (does not require token or consume API limits)
-                public_zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{br}.zip"
+            # 1. Try GitHub REST API (requires token for private, consumes API limits for public)
+            if GH_TOKEN:
+                zip_url = f"https://api.github.com/repos/{owner}/{repo}/zipball/{br}"
                 try:
-                    pub_hdrs = {"User-Agent": "Mozilla/5.0"}
-                    r_temp = req.get(public_zip_url, headers=pub_hdrs, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                    r_temp = req.get(zip_url, headers=hdrs, timeout=timeout, verify=True)
                     if r_temp.status_code == 200:
                         r = r_temp
                         default_br = br
@@ -1683,30 +1516,29 @@ def scan_dependencies(info, timeout=15):
                 except Exception:
                     pass
 
-                # 3. Try GitHub Public Zipball URL redirect
-                alt_public_zip_url = f"https://github.com/{owner}/{repo}/zipball/{br}"
-                try:
-                    pub_hdrs = {"User-Agent": "Mozilla/5.0"}
-                    r_temp = req.get(alt_public_zip_url, headers=pub_hdrs, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
-                    if r_temp.status_code == 200:
-                        r = r_temp
-                        default_br = br
-                        break
-                except Exception:
-                    pass
+            # 2. Try GitHub Public Head Archive URL (does not require token or consume API limits)
+            public_zip_url = f"https://github.com/{owner}/{repo}/archive/refs/heads/{br}.zip"
+            try:
+                pub_hdrs = {"User-Agent": "Mozilla/5.0"}
+                r_temp = req.get(public_zip_url, headers=pub_hdrs, timeout=timeout, verify=True)
+                if r_temp.status_code == 200:
+                    r = r_temp
+                    default_br = br
+                    break
+            except Exception:
+                pass
 
-            elif info["platform"] == "bitbucket":
-                # Public Zipball Download: Direct ZIP archive available at https://bitbucket.org/{owner}/{repo}/get/{branch}.zip
-                zip_url = f"https://bitbucket.org/{owner}/{repo}/get/{br}.zip"
-                try:
-                    pub_hdrs = {"User-Agent": "Mozilla/5.0"}
-                    r_temp = req.get(zip_url, headers=pub_hdrs, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
-                    if r_temp.status_code == 200:
-                        r = r_temp
-                        default_br = br
-                        break
-                except Exception:
-                    pass
+            # 3. Try GitHub Public Zipball URL redirect
+            alt_public_zip_url = f"https://github.com/{owner}/{repo}/zipball/{br}"
+            try:
+                pub_hdrs = {"User-Agent": "Mozilla/5.0"}
+                r_temp = req.get(alt_public_zip_url, headers=pub_hdrs, timeout=timeout, verify=True)
+                if r_temp.status_code == 200:
+                    r = r_temp
+                    default_br = br
+                    break
+            except Exception:
+                pass
 
         if r and r.status_code == 200:
             with zipfile.ZipFile(io.BytesIO(r.content)) as z:
@@ -1801,7 +1633,7 @@ def scan_dependencies(info, timeout=15):
         try:
             r = req.post("https://api.osv.dev/v1/querybatch",
                          json={"queries": queries},
-                         timeout=30, proxies=PROXY, verify=VERIFY_SSL)
+                         timeout=30, verify=True)
             if r.status_code != 200:
                 warn(f"OSV batch HTTP {r.status_code}")
                 continue
@@ -1827,7 +1659,7 @@ def scan_dependencies(info, timeout=15):
                     try:
                         quoted_id = quote(vid)
                         vr = req.get(f"https://api.osv.dev/v1/vulns/{quoted_id}",
-                                     timeout=15, proxies=PROXY, verify=VERIFY_SSL)
+                                     timeout=15, verify=True)
                         if vr.status_code == 200:
                             return vid, vr.json()
                     except Exception:
@@ -1943,7 +1775,7 @@ def _ddg_search(query, ua, timeout, max_results=8):
     try:
         r = req.get("https://html.duckduckgo.com/html/", params={"q": query},
                     headers={**ua, "Accept":"text/html,application/xhtml+xml"},
-                    timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                    timeout=timeout, verify=True)
         if r.status_code == 200:
             titles   = re.findall(r'class="result__a"[^>]*>([^<]+)', r.text)
             snippets = re.findall(r'class="result__snippet"[^>]*>([^<]+)', r.text)
@@ -1965,7 +1797,7 @@ def _epss_score(cve_id):
     import requests as req
     try:
         r = req.get(f"https://api.first.org/data/v1/epss?cve={cve_id}",
-                    timeout=10, proxies=PROXY, verify=VERIFY_SSL)
+                    timeout=10, verify=True)
         if r.status_code == 200:
             data = r.json().get("data",[])
             if data:
@@ -2028,7 +1860,7 @@ def gather_web_intel_opensource(info, timeout=20):
         try:
             r = req.get("https://api.github.com/search/repositories",
                         params={"q":q,"sort":"stars","per_page":6},
-                        headers=hdrs_gh, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                        headers=hdrs_gh, timeout=timeout, verify=True)
             queries_run += 1
             if r.status_code == 200:
                 for item in r.json().get("items",[]):
@@ -2047,11 +1879,11 @@ def gather_web_intel_opensource(info, timeout=20):
             warn(f"GitHub repo search error: {e}")
 
     # ── 2. GitHub Issues: target repo first, then global filtered ─────────────
-    if info.get("platform") == "github" and owner_r and repo_r:
+    if owner_r and repo_r:
         try:
             r = req.get(f"https://api.github.com/repos/{owner_r}/{repo_r}/issues",
                         params={"state":"open","labels":"security","per_page":20},
-                        headers=hdrs_gh, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                        headers=hdrs_gh, timeout=timeout, verify=True)
             queries_run += 1
             if r.status_code == 200:
                 for item in (r.json() if isinstance(r.json(),list) else [])[:10]:
@@ -2066,7 +1898,7 @@ def gather_web_intel_opensource(info, timeout=20):
         q_iss = f"{target} in:title CVE OR RCE OR injection OR bypass type:issue"
         r = req.get("https://api.github.com/search/issues",
                     params={"q":q_iss,"sort":"created","per_page":8},
-                    headers=hdrs_gh, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                    headers=hdrs_gh, timeout=timeout, verify=True)
         queries_run += 1
         if r.status_code == 200:
             for item in r.json().get("items",[]):
@@ -2206,7 +2038,7 @@ def gather_web_intel_freeware(info, timeout=20):
                 "https://html.duckduckgo.com/html/",
                 params={"q": q},
                 headers={**ua, "Accept": "text/html,application/xhtml+xml"},
-                timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                timeout=timeout, verify=True)
             queries_run += 1
             if r.status_code == 200:
                 titles   = re.findall(r'class="result__a"[^>]*>([^<]+)', r.text)
@@ -2238,7 +2070,7 @@ def gather_web_intel_freeware(info, timeout=20):
             r = req.get(
                 "https://api.github.com/search/repositories",
                 params={"q":q,"sort":"stars","per_page":4},
-                headers=hdrs_gh, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+                headers=hdrs_gh, timeout=timeout, verify=True)
             queries_run += 1
             if r.status_code == 200:
                 for item in r.json().get("items",[]):
@@ -2257,7 +2089,7 @@ def gather_web_intel_freeware(info, timeout=20):
         r = req.post(
             "https://mb-api.abuse.ch/api/v1/",
             data={"query":"get_info","tag":target},
-            headers=ua, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+            headers=ua, timeout=timeout, verify=True)
         queries_run += 1
         if r.status_code == 200:
             data = r.json()
@@ -2285,7 +2117,7 @@ def gather_web_intel_freeware(info, timeout=20):
             "https://html.duckduckgo.com/html/",
             params={"q": f"site:exploit-db.com {target}"},
             headers={**ua, "Accept": "text/html,application/xhtml+xml"},
-            timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+            timeout=timeout, verify=True)
         queries_run += 1
         if r.status_code == 200:
             titles   = re.findall(r'class="result__a"[^>]*>([^<]+)', r.text)
@@ -2311,7 +2143,7 @@ def gather_web_intel_freeware(info, timeout=20):
         r = req.post(
             "https://urlhaus-api.abuse.ch/v1/payload/",
             data={"query":"get_payloads","tag":target},
-            headers=ua, timeout=timeout, proxies=PROXY, verify=VERIFY_SSL)
+            headers=ua, timeout=timeout, verify=True)
         queries_run += 1
         if r.status_code == 200:
             data = r.json()
@@ -2514,7 +2346,7 @@ def _scan_virustotal(filepath, known_sha256=None):
         try:
             ok(f"Checking VT for existing report (SHA-256: {known_sha256[:16]}...)...")
             pr = req.get(f"https://www.virustotal.com/api/v3/files/{known_sha256}",
-                         headers=vt_hdrs, timeout=20, proxies=PROXY, verify=VERIFY_SSL)
+                         headers=vt_hdrs, timeout=20, verify=True)
             if pr.status_code == 200:
                 attrs  = pr.json().get("data", {}).get("attributes", {})
                 stats  = attrs.get("last_analysis_stats", {})
@@ -2555,7 +2387,7 @@ def _scan_virustotal(filepath, known_sha256=None):
             ok("File > 32 MB — requesting large-file upload URL...")
             lur = req.get("https://www.virustotal.com/api/v3/files/upload_url",
                           headers=vt_hdrs, timeout=30,
-                          proxies=PROXY, verify=VERIFY_SSL)
+                          verify=True)
             if lur.status_code == 200:
                 upload_url = lur.json().get("data") or "https://www.virustotal.com/api/v3/files"
             else:
@@ -2568,7 +2400,7 @@ def _scan_virustotal(filepath, known_sha256=None):
         with open(filepath, "rb") as fh:
             up = req.post(upload_url, headers=vt_hdrs,
                           files={"file": (fname, fh, "application/octet-stream")},
-                          timeout=300, proxies=PROXY, verify=VERIFY_SSL)
+                          timeout=300, verify=True)
 
         if up.status_code not in (200, 201):
             warn(f"VT upload HTTP {up.status_code}: {up.text[:200]}")
@@ -2582,7 +2414,7 @@ def _scan_virustotal(filepath, known_sha256=None):
             time.sleep(15)
             pr = req.get(f"https://www.virustotal.com/api/v3/analyses/{analysis_id}",
                          headers=vt_hdrs, timeout=30,
-                         proxies=PROXY, verify=VERIFY_SSL)
+                         verify=True)
             if pr.status_code != 200:
                 warn(f"  Poll error HTTP {pr.status_code}"); continue
             pdata  = pr.json()
@@ -2610,7 +2442,7 @@ def _scan_virustotal(filepath, known_sha256=None):
                 ok(f"Fetching full file report (SHA-256: {file_sha})...")
                 fr = req.get(f"https://www.virustotal.com/api/v3/files/{file_sha}",
                              headers=vt_hdrs, timeout=30,
-                             proxies=PROXY, verify=VERIFY_SSL)
+                             verify=True)
                 if fr.status_code != 200:
                     warn(f"  File report HTTP {fr.status_code}"); continue
                 attrs   = fr.json().get("data", {}).get("attributes", {})
@@ -2704,7 +2536,7 @@ def _scan_hybrid_analysis(filepath, sha256):
             ok(f"Checking HA for existing report (SHA-256: {sha256[:16]}...)...")
             sr = req.get("https://www.hybrid-analysis.com/api/v2/search/hash",
                          params={"hash": sha256},
-                         headers=ha_hdrs, timeout=20, proxies=PROXY, verify=VERIFY_SSL)
+                         headers=ha_hdrs, timeout=20, verify=True)
             if sr.status_code == 200:
                 results_ha = sr.json()
                 if isinstance(results_ha, list) and results_ha:
@@ -2786,7 +2618,7 @@ def _scan_hybrid_analysis(filepath, sha256):
                 headers=ha_hdrs,
                 files={"file": (fname, fh, "application/octet-stream")},
                 data={"environment_id": "110"},   # 110 = Windows 10 64-bit
-                timeout=120, proxies=PROXY, verify=VERIFY_SSL)
+                timeout=120, verify=True)
 
         ok(f"  Submit response: HTTP {up.status_code}")
 
@@ -2811,7 +2643,7 @@ def _scan_hybrid_analysis(filepath, sha256):
             time.sleep(_sleep)
             sr = req.get(f"https://www.hybrid-analysis.com/api/v2/report/{job_id}/state",
                          headers=ha_hdrs, timeout=30,
-                         proxies=PROXY, verify=VERIFY_SSL)
+                         verify=True)
             if sr.status_code == 200:
                 sdata = sr.json()
                 state = sdata.get("state", "")
@@ -2827,14 +2659,14 @@ def _scan_hybrid_analysis(filepath, sha256):
 
         ok(f"  Fetching overview for sha256: {final_sha}")
         ov = req.get(f"https://www.hybrid-analysis.com/api/v2/overview/{final_sha}",
-                     headers=ha_hdrs, timeout=30, proxies=PROXY, verify=VERIFY_SSL)
+                     headers=ha_hdrs, timeout=30, verify=True)
         if ov.status_code == 200:
             result = _parse_full(ov.json())
             ok(f"HA RESULT (sandbox): verdict={result['verdict']}  score={result['threat_score']}/100")
             return result
 
         sr2 = req.get(f"https://www.hybrid-analysis.com/api/v2/report/{job_id}/summary",
-                      headers=ha_hdrs, timeout=30, proxies=PROXY, verify=VERIFY_SSL)
+                      headers=ha_hdrs, timeout=30, verify=True)
         if sr2.status_code == 200:
             result = _parse_full(sr2.json())
             ok(f"HA RESULT (summary fallback): verdict={result['verdict']}")
@@ -2860,7 +2692,7 @@ def _scan_hybrid_analysis(filepath, sha256):
                 headers=ha_hdrs,
                 files={"file": (fname, fh, "application/octet-stream")},
                 data={"scan_type": "all"},
-                timeout=120, proxies=PROXY, verify=VERIFY_SSL)
+                timeout=120, verify=True)
 
         ok(f"  Quick Scan response: HTTP {qr.status_code}")
         if qr.status_code not in (200, 201):
@@ -2878,7 +2710,7 @@ def _scan_hybrid_analysis(filepath, sha256):
                 time.sleep(10)
                 pr = req.get(f"https://www.hybrid-analysis.com/api/v2/quick-scan/{scan_id}",
                              headers=ha_hdrs, timeout=30,
-                             proxies=PROXY, verify=VERIFY_SSL)
+                             verify=True)
                 if pr.status_code == 200:
                     qdata    = pr.json()
                     finished = qdata.get("finished", False)
@@ -3196,7 +3028,7 @@ def _groq_call(messages, max_tokens, temperature, step_label):
                          "Content-Type": "application/json"},
                 json={"model": model, "messages": messages,
                       "max_tokens": max_tokens, "temperature": temperature},
-                timeout=60, proxies=PROXY, verify=VERIFY_SSL)
+                timeout=60, verify=True)
             if r.status_code == 200:
                 return r.json()["choices"][0]["message"]["content"], model
             elif r.status_code == 429:
@@ -4460,7 +4292,7 @@ def interactive_prompt():
     print(f"{'--'*33}\n")
     while True:
         try:
-            t = sys.argv[1].strip()
+            t = input(f"  {CY}> Tool name or URL: {R}").strip()
         except EOFError:
             fail("No input."); sys.exit(0)
         if t: return t
@@ -4473,7 +4305,7 @@ def interactive_download_url():
     print(f"  {DIM}Paste the DIRECT installer URL (.exe/.msi/.zip/.dmg/etc.){R}")
     print(f"  {DIM}Or press Enter to skip the file scan.{R}\n")
     try:
-        u = sys.argv[2].strip()
+        u = input(f"  {CY}> Installer URL (or blank to skip): {R}").strip()
     except (EOFError, KeyboardInterrupt):
         return ""
     return u
@@ -4481,7 +4313,7 @@ def interactive_download_url():
 
 def main():
     print(BANNER)
-    # ensure_packages()
+    ensure_packages()
 
     parser = argparse.ArgumentParser(prog="python OSFWTE8.py",
         description="OS/FT Analyzer v8 -- Open Source / Freeware Tool Security Analyzer")
