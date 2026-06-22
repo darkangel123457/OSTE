@@ -63,7 +63,7 @@ def warn(m): print(f"  {YL}{B}[!]{R} {m}")
 def fail(m): print(f"  {RD}{B}[-]{R} {m}")
 
 # ── HARDCODED API KEYS (per user request) ─────────────────────────────────────
-GROQ_KEY      = "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"
+GROQ_KEY      = "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"
 VT_KEY        = os.getenv("VT_API_KEY",   "b6d39ea0aff86f459c2f991e963f586b6127f03307a5b81dc5dcaa938a4aaa0b")
 HA_KEY        = os.getenv("HA_API_KEY",   "k5yq3o9mefd29601x8zxvile581067b1wt8v64kve1f58ba6x5j4bfob91f90239")
 NVD_KEY       = os.getenv("NVD_API_KEY",  "")
